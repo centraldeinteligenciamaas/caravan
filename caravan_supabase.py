@@ -1,6 +1,6 @@
 """
 caravan_supabase.py
-Cria as tabelas do Caravan no Supabase e sincroniza os dados das APIs.
+Cria/migra as tabelas do Caravan no Supabase e sincroniza os dados das APIs.
 
 Uso local:
     export $(cat .env | xargs)
@@ -12,10 +12,8 @@ Via GitHub Actions:
 
 import os
 import sys
-import json
 import requests
 import psycopg2
-import psycopg2.extras
 from datetime import datetime, timezone, timedelta
 
 
@@ -23,12 +21,12 @@ from datetime import datetime, timezone, timedelta
 # CONFIGURAÇÃO
 # ──────────────────────────────────────────────────────────────────────────────
 
-API_KEY      = os.environ.get("CARAVAN_API_KEY")
-API_BASE     = "https://api.maas.caravanfleet.com.br/integration"
-HEADERS      = {"x-api-key": API_KEY} if API_KEY else {}
+API_KEY   = os.environ.get("CARAVAN_API_KEY")
+API_BASE  = "https://api.maas.caravanfleet.com.br/integration"
+HEADERS   = {"x-api-key": API_KEY} if API_KEY else {}
 
-BRT          = timezone(timedelta(hours=-3))
-SYNC_DAYS    = 30   # janela de sync de largadas (últimos 30 dias)
+BRT       = timezone(timedelta(hours=-3))
+SYNC_DAYS = 30   # janela de sync de largadas (últimos N dias)
 
 
 def get_connection():
@@ -56,200 +54,210 @@ def get_connection():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DDL — TABELAS, ÍNDICES E TRIGGERS
+# DDL — cada item é UMA statement SQL (sem encadeamento)
+# Usar statements separadas evita que um COMMENT quebre uma CREATE TABLE
+# que já existia. Savepoints garantem que um erro não aborta os demais.
 # ──────────────────────────────────────────────────────────────────────────────
 
 STATEMENTS = [
-    {
-        "label": "tabela: motoristas",
-        "sql": """
-            CREATE TABLE IF NOT EXISTS motoristas (
-                id          SERIAL       PRIMARY KEY,
-                chapa       VARCHAR(20)  NOT NULL UNIQUE,
-                nome        VARCHAR(200) NOT NULL,
-                funcao      VARCHAR(100),
-                status      VARCHAR(20)  NOT NULL DEFAULT 'ATIVO'
-                                CHECK (status IN ('ATIVO', 'INATIVO', 'AFASTADO')),
-                created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-            );
-            COMMENT ON TABLE  motoristas        IS 'Cadastro de motoristas da frota Caravan';
-            COMMENT ON COLUMN motoristas.chapa  IS 'employeeId da API';
-            COMMENT ON COLUMN motoristas.funcao IS 'Ex: MOTORISTA/CAMINHAO, MOTORISTA/VEICULOS LEVES';
-            COMMENT ON COLUMN motoristas.status IS 'ATIVO | INATIVO | AFASTADO';
-        """,
-    },
-    {
-        "label": "tabela: escala",
-        "sql": """
-            CREATE TABLE IF NOT EXISTS escala (
-                id                 SERIAL       PRIMARY KEY,
-                motorista_id       INTEGER      NOT NULL
-                                       REFERENCES motoristas(id) ON DELETE CASCADE,
-                numero_contrato    VARCHAR(20)  NOT NULL,
-                cliente            VARCHAR(200),
-                turno              VARCHAR(30)  NOT NULL
-                                       CHECK (turno IN (
-                                           'PRIMEIRO TURNO', 'SEGUNDO TURNO', 'TERCEIRO TURNO'
-                                       )),
-                tipo_escala        VARCHAR(20)  NOT NULL DEFAULT 'FIXO'
-                                       CHECK (tipo_escala IN (
-                                           'FIXO', 'FOLGUISTA', 'RESERVA', 'AFASTADO', 'APOIO'
-                                       )),
-                prefixo            VARCHAR(20),
-                placa              VARCHAR(20),
-                modelo_veiculo     VARCHAR(100),
-                local_apresentacao VARCHAR(200),
-                hora_inicio        TIME,
-                hora_fim           TIME,
-                created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                CONSTRAINT escala_motorista_contrato_unica
-                    UNIQUE (motorista_id, numero_contrato)
-            );
-            COMMENT ON TABLE  escala                 IS 'Escala de turnos dos motoristas por contrato';
-            COMMENT ON COLUMN escala.tipo_escala     IS 'FIXO | FOLGUISTA | RESERVA | AFASTADO | APOIO';
-            COMMENT ON COLUMN escala.prefixo         IS 'Prefixo do veículo (ex: 5781.0)';
-            COMMENT ON COLUMN escala.local_apresentacao IS 'Local de início do turno';
-        """,
-    },
-    {
-        "label": "tabela: largadas",
-        "sql": """
-            CREATE TABLE IF NOT EXISTS largadas (
-                id                 SERIAL       PRIMARY KEY,
-                departure_id       INTEGER      UNIQUE,
-                shift_name         VARCHAR(200),
-                driver_name        VARCHAR(200),
-                plate              VARCHAR(20),
-                prefixo            VARCHAR(20),
-                vehicle_model      VARCHAR(100),
-                number_contract    VARCHAR(20),
-                supplier_customer  VARCHAR(200),
-                trade_name         VARCHAR(200),
-                local_apresentacao VARCHAR(200),
-                start_time         TIME,
-                end_time           TIME,
-                departure_datetime TIMESTAMPTZ,
-                synced_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-            );
-            COMMENT ON TABLE  largadas                    IS 'Largadas via API /integration/last-departures-by-date';
-            COMMENT ON COLUMN largadas.departure_id       IS 'departureId da API — chave de idempotência';
-            COMMENT ON COLUMN largadas.departure_datetime IS 'Data e hora exata da largada';
-            COMMENT ON COLUMN largadas.synced_at          IS 'Última sincronização com a API';
-        """,
-    },
-    {
-        "label": "tabela: ferias",
-        "sql": """
-            CREATE TABLE IF NOT EXISTS ferias (
-                id              SERIAL       PRIMARY KEY,
-                motorista_id    INTEGER      NOT NULL
-                                    REFERENCES motoristas(id) ON DELETE CASCADE,
-                api_id          INTEGER      UNIQUE,
-                data_inicio     DATE         NOT NULL,
-                data_fim        DATE         NOT NULL,
-                dias_gozados    INTEGER      GENERATED ALWAYS AS (
-                                    (data_fim - data_inicio + 1)
-                                ) STORED,
-                substituto_id   INTEGER      REFERENCES motoristas(id) ON DELETE SET NULL,
-                publish_date    DATE,
-                created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                CONSTRAINT ferias_datas_validas CHECK (data_fim >= data_inicio)
-            );
-            COMMENT ON TABLE  ferias              IS 'Férias dos motoristas (via driver-consolidated)';
-            COMMENT ON COLUMN ferias.api_id       IS 'id do objeto vacation na API';
-            COMMENT ON COLUMN ferias.dias_gozados IS 'Calculado automaticamente';
-        """,
-    },
-    {
-        "label": "tabela: folga",
-        "sql": """
-            CREATE TABLE IF NOT EXISTS folga (
-                id            SERIAL       PRIMARY KEY,
-                motorista_id  INTEGER      NOT NULL
-                                  REFERENCES motoristas(id) ON DELETE CASCADE,
-                api_id        INTEGER      UNIQUE,
-                data_folga    DATE         NOT NULL,
-                substituto_id INTEGER      REFERENCES motoristas(id) ON DELETE SET NULL,
-                publish_date  DATE,
-                created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-                CONSTRAINT folga_unica_por_dia
-                    UNIQUE (motorista_id, data_folga)
-            );
-            COMMENT ON TABLE  folga               IS 'Folgas dos motoristas (via driver-consolidated)';
-            COMMENT ON COLUMN folga.api_id        IS 'id do objeto dayOff na API';
-            COMMENT ON COLUMN folga.substituto_id IS 'Motorista que cobriu a folga';
-        """,
-    },
-    # Índices
-    {"label": "índice: motoristas.chapa",       "sql": "CREATE INDEX IF NOT EXISTS idx_motoristas_chapa    ON motoristas(chapa);"},
-    {"label": "índice: motoristas.nome",        "sql": "CREATE INDEX IF NOT EXISTS idx_motoristas_nome     ON motoristas(nome);"},
-    {"label": "índice: escala.motorista_id",    "sql": "CREATE INDEX IF NOT EXISTS idx_escala_motorista    ON escala(motorista_id);"},
-    {"label": "índice: escala.contrato",        "sql": "CREATE INDEX IF NOT EXISTS idx_escala_contrato     ON escala(numero_contrato);"},
-    {"label": "índice: largadas.datetime",      "sql": "CREATE INDEX IF NOT EXISTS idx_largadas_dt         ON largadas(departure_datetime DESC);"},
-    {"label": "índice: largadas.contrato",      "sql": "CREATE INDEX IF NOT EXISTS idx_largadas_contrato   ON largadas(number_contract);"},
-    {"label": "índice: ferias.motorista_id",    "sql": "CREATE INDEX IF NOT EXISTS idx_ferias_motorista    ON ferias(motorista_id);"},
-    {"label": "índice: ferias.datas",           "sql": "CREATE INDEX IF NOT EXISTS idx_ferias_datas        ON ferias(data_inicio, data_fim);"},
-    {"label": "índice: folga.motorista_id",     "sql": "CREATE INDEX IF NOT EXISTS idx_folga_motorista     ON folga(motorista_id);"},
-    {"label": "índice: folga.data",             "sql": "CREATE INDEX IF NOT EXISTS idx_folga_data          ON folga(data_folga);"},
-    # Trigger updated_at
-    {
-        "label": "função: set_updated_at",
-        "sql": """
-            CREATE OR REPLACE FUNCTION set_updated_at()
-            RETURNS TRIGGER AS $$
-            BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
-            $$ LANGUAGE plpgsql;
-        """,
-    },
-    {
-        "label": "trigger: motoristas.updated_at",
-        "sql": """
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_motoristas_updated_at') THEN
-                    CREATE TRIGGER trg_motoristas_updated_at BEFORE UPDATE ON motoristas
-                    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-                END IF;
-            END $$;
-        """,
-    },
-    {
-        "label": "trigger: escala.updated_at",
-        "sql": """
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_escala_updated_at') THEN
-                    CREATE TRIGGER trg_escala_updated_at BEFORE UPDATE ON escala
-                    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-                END IF;
-            END $$;
-        """,
-    },
-    {
-        "label": "trigger: ferias.updated_at",
-        "sql": """
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_ferias_updated_at') THEN
-                    CREATE TRIGGER trg_ferias_updated_at BEFORE UPDATE ON ferias
-                    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-                END IF;
-            END $$;
-        """,
-    },
-    {
-        "label": "trigger: folga.updated_at",
-        "sql": """
-            DO $$ BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_folga_updated_at') THEN
-                    CREATE TRIGGER trg_folga_updated_at BEFORE UPDATE ON folga
-                    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-                END IF;
-            END $$;
-        """,
-    },
+
+    # ── MOTORISTAS ────────────────────────────────────────────────────────────
+    {"label": "tabela: motoristas", "sql": """
+        CREATE TABLE IF NOT EXISTS motoristas (
+            id          SERIAL       PRIMARY KEY,
+            chapa       VARCHAR(20)  NOT NULL UNIQUE,
+            nome        VARCHAR(200) NOT NULL,
+            funcao      VARCHAR(100),
+            status      VARCHAR(20)  NOT NULL DEFAULT 'ATIVO'
+                            CHECK (status IN ('ATIVO', 'INATIVO', 'AFASTADO')),
+            created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )
+    """},
+    {"label": "comment: motoristas", "sql": """
+        COMMENT ON TABLE motoristas IS 'Cadastro de motoristas da frota Caravan'
+    """},
+
+    # ── ESCALA ────────────────────────────────────────────────────────────────
+    {"label": "tabela: escala", "sql": """
+        CREATE TABLE IF NOT EXISTS escala (
+            id                 SERIAL       PRIMARY KEY,
+            motorista_id       INTEGER      NOT NULL
+                                   REFERENCES motoristas(id) ON DELETE CASCADE,
+            numero_contrato    VARCHAR(20)  NOT NULL,
+            cliente            VARCHAR(200),
+            turno              VARCHAR(30)  NOT NULL
+                                   CHECK (turno IN (
+                                       'PRIMEIRO TURNO','SEGUNDO TURNO','TERCEIRO TURNO'
+                                   )),
+            tipo_escala        VARCHAR(20)  NOT NULL DEFAULT 'FIXO'
+                                   CHECK (tipo_escala IN (
+                                       'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO'
+                                   )),
+            prefixo            VARCHAR(20),
+            placa              VARCHAR(20),
+            modelo_veiculo     VARCHAR(100),
+            local_apresentacao VARCHAR(200),
+            hora_inicio        TIME,
+            hora_fim           TIME,
+            created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            CONSTRAINT escala_motorista_contrato_unica
+                UNIQUE (motorista_id, numero_contrato)
+        )
+    """},
+
+    # ── LARGADAS ──────────────────────────────────────────────────────────────
+    {"label": "tabela: largadas", "sql": """
+        CREATE TABLE IF NOT EXISTS largadas (
+            id                 SERIAL       PRIMARY KEY,
+            departure_id       INTEGER      UNIQUE,
+            shift_name         VARCHAR(200),
+            driver_name        VARCHAR(200),
+            plate              VARCHAR(20),
+            prefixo            VARCHAR(20),
+            vehicle_model      VARCHAR(100),
+            number_contract    VARCHAR(20),
+            supplier_customer  VARCHAR(200),
+            trade_name         VARCHAR(200),
+            local_apresentacao VARCHAR(200),
+            start_time         TIME,
+            end_time           TIME,
+            departure_datetime TIMESTAMPTZ,
+            synced_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )
+    """},
+
+    # ── FERIAS ────────────────────────────────────────────────────────────────
+    {"label": "tabela: ferias", "sql": """
+        CREATE TABLE IF NOT EXISTS ferias (
+            id           SERIAL       PRIMARY KEY,
+            motorista_id INTEGER      NOT NULL
+                             REFERENCES motoristas(id) ON DELETE CASCADE,
+            api_id       INTEGER      UNIQUE,
+            data_inicio  DATE         NOT NULL,
+            data_fim     DATE         NOT NULL,
+            dias_gozados INTEGER      GENERATED ALWAYS AS (
+                             (data_fim - data_inicio + 1)
+                         ) STORED,
+            substituto_id INTEGER     REFERENCES motoristas(id) ON DELETE SET NULL,
+            publish_date DATE,
+            created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            CONSTRAINT ferias_datas_validas CHECK (data_fim >= data_inicio)
+        )
+    """},
+    # Migração: adiciona api_id caso a tabela ferias já exista sem ela
+    {"label": "migração: ferias.api_id", "sql": """
+        ALTER TABLE ferias ADD COLUMN IF NOT EXISTS api_id INTEGER
+    """},
+    {"label": "migração: ferias.api_id unique", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'ferias_api_id_key' AND conrelid = 'ferias'::regclass
+            ) THEN
+                ALTER TABLE ferias ADD CONSTRAINT ferias_api_id_key UNIQUE (api_id);
+            END IF;
+        END $$
+    """},
+    {"label": "migração: ferias.substituto_id", "sql": """
+        ALTER TABLE ferias ADD COLUMN IF NOT EXISTS substituto_id INTEGER
+            REFERENCES motoristas(id) ON DELETE SET NULL
+    """},
+    {"label": "migração: ferias.publish_date", "sql": """
+        ALTER TABLE ferias ADD COLUMN IF NOT EXISTS publish_date DATE
+    """},
+
+    # ── FOLGA ─────────────────────────────────────────────────────────────────
+    {"label": "tabela: folga", "sql": """
+        CREATE TABLE IF NOT EXISTS folga (
+            id            SERIAL       PRIMARY KEY,
+            motorista_id  INTEGER      NOT NULL
+                              REFERENCES motoristas(id) ON DELETE CASCADE,
+            api_id        INTEGER      UNIQUE,
+            data_folga    DATE         NOT NULL,
+            substituto_id INTEGER      REFERENCES motoristas(id) ON DELETE SET NULL,
+            publish_date  DATE,
+            created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            CONSTRAINT folga_unica_por_dia UNIQUE (motorista_id, data_folga)
+        )
+    """},
+    # Migração: adiciona api_id caso a tabela folga já exista sem ela
+    {"label": "migração: folga.api_id", "sql": """
+        ALTER TABLE folga ADD COLUMN IF NOT EXISTS api_id INTEGER
+    """},
+    {"label": "migração: folga.api_id unique", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'folga_api_id_key' AND conrelid = 'folga'::regclass
+            ) THEN
+                ALTER TABLE folga ADD CONSTRAINT folga_api_id_key UNIQUE (api_id);
+            END IF;
+        END $$
+    """},
+    {"label": "migração: folga.substituto_id", "sql": """
+        ALTER TABLE folga ADD COLUMN IF NOT EXISTS substituto_id INTEGER
+            REFERENCES motoristas(id) ON DELETE SET NULL
+    """},
+    {"label": "migração: folga.publish_date", "sql": """
+        ALTER TABLE folga ADD COLUMN IF NOT EXISTS publish_date DATE
+    """},
+
+    # ── ÍNDICES ───────────────────────────────────────────────────────────────
+    {"label": "índice: motoristas.chapa",    "sql": "CREATE INDEX IF NOT EXISTS idx_motoristas_chapa    ON motoristas(chapa)"},
+    {"label": "índice: motoristas.nome",     "sql": "CREATE INDEX IF NOT EXISTS idx_motoristas_nome     ON motoristas(nome)"},
+    {"label": "índice: escala.motorista_id", "sql": "CREATE INDEX IF NOT EXISTS idx_escala_motorista    ON escala(motorista_id)"},
+    {"label": "índice: escala.contrato",     "sql": "CREATE INDEX IF NOT EXISTS idx_escala_contrato     ON escala(numero_contrato)"},
+    {"label": "índice: largadas.datetime",   "sql": "CREATE INDEX IF NOT EXISTS idx_largadas_dt         ON largadas(departure_datetime DESC)"},
+    {"label": "índice: largadas.contrato",   "sql": "CREATE INDEX IF NOT EXISTS idx_largadas_contrato   ON largadas(number_contract)"},
+    {"label": "índice: ferias.motorista_id", "sql": "CREATE INDEX IF NOT EXISTS idx_ferias_motorista    ON ferias(motorista_id)"},
+    {"label": "índice: ferias.datas",        "sql": "CREATE INDEX IF NOT EXISTS idx_ferias_datas        ON ferias(data_inicio, data_fim)"},
+    {"label": "índice: folga.motorista_id",  "sql": "CREATE INDEX IF NOT EXISTS idx_folga_motorista     ON folga(motorista_id)"},
+    {"label": "índice: folga.data",          "sql": "CREATE INDEX IF NOT EXISTS idx_folga_data          ON folga(data_folga)"},
+
+    # ── TRIGGER updated_at ────────────────────────────────────────────────────
+    {"label": "função: set_updated_at", "sql": """
+        CREATE OR REPLACE FUNCTION set_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN NEW.updated_at = NOW(); RETURN NEW; END;
+        $$ LANGUAGE plpgsql
+    """},
+    {"label": "trigger: motoristas.updated_at", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_motoristas_updated_at') THEN
+                CREATE TRIGGER trg_motoristas_updated_at BEFORE UPDATE ON motoristas
+                FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+            END IF;
+        END $$
+    """},
+    {"label": "trigger: escala.updated_at", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_escala_updated_at') THEN
+                CREATE TRIGGER trg_escala_updated_at BEFORE UPDATE ON escala
+                FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+            END IF;
+        END $$
+    """},
+    {"label": "trigger: ferias.updated_at", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_ferias_updated_at') THEN
+                CREATE TRIGGER trg_ferias_updated_at BEFORE UPDATE ON ferias
+                FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+            END IF;
+        END $$
+    """},
+    {"label": "trigger: folga.updated_at", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_folga_updated_at') THEN
+                CREATE TRIGGER trg_folga_updated_at BEFORE UPDATE ON folga
+                FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+            END IF;
+        END $$
+    """},
 ]
 
 
@@ -260,10 +268,8 @@ STATEMENTS = [
 def log(msg):
     print(f"  {msg}")
 
-
 def separador(char="─", n=55):
     print(char * n)
-
 
 def api_get(path, params=None):
     url = f"{API_BASE}/{path}"
@@ -271,53 +277,53 @@ def api_get(path, params=None):
     resp.raise_for_status()
     return resp.json()
 
-
-def normalizar_turno(shift_name: str) -> str:
+def normalizar_turno(shift_name):
     s = (shift_name or "").lower()
-    if "primeiro" in s or "1" in s:  return "PRIMEIRO TURNO"
-    if "segundo"  in s or "2" in s:  return "SEGUNDO TURNO"
-    if "terceiro" in s or "3" in s:  return "TERCEIRO TURNO"
+    if "primeiro" in s or "1" in s: return "PRIMEIRO TURNO"
+    if "segundo"  in s or "2" in s: return "SEGUNDO TURNO"
+    if "terceiro" in s or "3" in s: return "TERCEIRO TURNO"
     return "PRIMEIRO TURNO"
 
+def normalizar_tipo(tipo):
+    return {
+        "fixo": "FIXO", "folguista": "FOLGUISTA", "reserva": "RESERVA",
+        "afastado": "AFASTADO", "apoio": "APOIO",
+        "ferista": "AFASTADO", "nenhum": "FIXO",
+    }.get((tipo or "").lower(), "FIXO")
 
-def normalizar_tipo(tipo: str) -> str:
-    mapa = {
-        "fixo":      "FIXO",
-        "folguista": "FOLGUISTA",
-        "reserva":   "RESERVA",
-        "afastado":  "AFASTADO",
-        "apoio":     "APOIO",
-        "ferista":   "AFASTADO",
-        "nenhum":    "FIXO",
-    }
-    return mapa.get((tipo or "").lower(), "FIXO")
-
-
-def normalizar_status(status: str) -> str:
+def normalizar_status(status):
     s = (status or "").lower()
-    if "ativo"    in s: return "ATIVO"
-    if "inativo"  in s: return "INATIVO"
-    if "afastado" in s: return "AFASTADO"
-    return "ATIVO"
+    if "ativo"   in s: return "ATIVO"
+    if "inativo" in s: return "INATIVO"
+    return "AFASTADO"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ETAPA 1 — DDL
+# ETAPA 1 — DDL com savepoints (um erro não aborta os demais)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def criar_tabelas(cur):
     separador("=")
     print("  ETAPA 1 — Estrutura das tabelas")
     separador("=")
-    erros = []
+
+    avisos = []
     for i, item in enumerate(STATEMENTS, 1):
         try:
+            cur.execute("SAVEPOINT ddl_sp")
             cur.execute(item["sql"])
+            cur.execute("RELEASE SAVEPOINT ddl_sp")
             log(f"✅ [{i:02d}] {item['label']}")
         except Exception as e:
-            log(f"❌ [{i:02d}] {item['label']} → {e}")
-            erros.append(item["label"])
-    return erros
+            cur.execute("ROLLBACK TO SAVEPOINT ddl_sp")
+            # Avisos esperados: objeto já existe, constraint já existe, etc.
+            msg = str(e).strip().replace("\n", " ")
+            log(f"⚠️  [{i:02d}] {item['label']} → {msg}")
+            avisos.append(item["label"])
+
+    if avisos:
+        log(f"\n  ℹ️  {len(avisos)} statement(s) puladas (objetos já existentes ou incompatíveis)")
+    return []   # nunca aborta por DDL — avisos são esperados em re-execuções
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -345,9 +351,9 @@ def sync_drivers(cur):
             INSERT INTO motoristas (chapa, nome, funcao, status)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (chapa) DO UPDATE SET
-                nome      = EXCLUDED.nome,
-                funcao    = EXCLUDED.funcao,
-                status    = EXCLUDED.status,
+                nome       = EXCLUDED.nome,
+                funcao     = EXCLUDED.funcao,
+                status     = EXCLUDED.status,
                 updated_at = NOW()
             RETURNING (xmax = 0) AS inserido
         """, (
@@ -365,11 +371,14 @@ def sync_drivers(cur):
         # ── Escala ─────────────────────────────────────────────────────────
         sched = item.get("regularSchedule") or {}
         if sched:
-            veiculo = sched.get("vehicle") or {}
-            shift   = sched.get("shift") or drv.get("shift") or {}
-            loc     = sched.get("startLocation") or {}
-            turno   = normalizar_turno(shift.get("shiftName", ""))
+            veiculo  = sched.get("vehicle") or {}
+            shift    = sched.get("shift") or drv.get("shift") or {}
+            loc      = sched.get("startLocation") or {}
+            turno    = normalizar_turno(shift.get("shiftName", ""))
             contrato = drv.get("contractNumber", "")
+            modelo   = " - ".join(filter(None, [
+                veiculo.get("brandName"), veiculo.get("modelName")
+            ])) or None
 
             cur.execute("""
                 INSERT INTO escala (
@@ -393,8 +402,7 @@ def sync_drivers(cur):
             """, (
                 mot_id, contrato, drv.get("clientName"),
                 turno, normalizar_tipo(drv.get("type", "Fixo")),
-                veiculo.get("prefixo"), veiculo.get("plate"),
-                f"{veiculo.get('brandName','')} - {veiculo.get('modelName','')}".strip(" -") or None,
+                veiculo.get("prefixo"), veiculo.get("plate"), modelo,
                 loc.get("name"),
                 shift.get("startTime"), shift.get("endTime"),
             ))
@@ -403,13 +411,7 @@ def sync_drivers(cur):
 
         # ── Férias ─────────────────────────────────────────────────────────
         for vac in item.get("vacations", []):
-            sub_id = None
-            if vac.get("substituteDriver"):
-                sub_chapa = str(vac["substituteDriver"]["employeeId"])
-                cur.execute("SELECT id FROM motoristas WHERE chapa = %s", (sub_chapa,))
-                row = cur.fetchone()
-                if row: sub_id = row[0]
-
+            sub_id = _resolve_substituto(cur, vac.get("substituteDriver"))
             cur.execute("""
                 INSERT INTO ferias (motorista_id, api_id, data_inicio, data_fim,
                                     substituto_id, publish_date)
@@ -431,13 +433,7 @@ def sync_drivers(cur):
 
         # ── Folgas ─────────────────────────────────────────────────────────
         for off in item.get("dayOffs", []):
-            sub_id = None
-            if off.get("substituteDriver"):
-                sub_chapa = str(off["substituteDriver"]["employeeId"])
-                cur.execute("SELECT id FROM motoristas WHERE chapa = %s", (sub_chapa,))
-                row = cur.fetchone()
-                if row: sub_id = row[0]
-
+            sub_id = _resolve_substituto(cur, off.get("substituteDriver"))
             cur.execute("""
                 INSERT INTO folga (motorista_id, api_id, data_folga,
                                    substituto_id, publish_date)
@@ -455,10 +451,20 @@ def sync_drivers(cur):
             if cur.fetchone()[0]: fol_ins += 1
             else:                 fol_upd += 1
 
-    log(f"  motoristas  → {mot_ins} inseridos / {mot_upd} atualizados")
-    log(f"  escala      → {esc_ins} inseridos / {esc_upd} atualizados")
-    log(f"  férias      → {fer_ins} inseridos / {fer_upd} atualizados")
-    log(f"  folgas      → {fol_ins} inseridos / {fol_upd} atualizados")
+    log(f"  motoristas → {mot_ins} inseridos / {mot_upd} atualizados")
+    log(f"  escala     → {esc_ins} inseridos / {esc_upd} atualizados")
+    log(f"  férias     → {fer_ins} inseridos / {fer_upd} atualizados")
+    log(f"  folgas     → {fol_ins} inseridos / {fol_upd} atualizados")
+
+
+def _resolve_substituto(cur, substituto):
+    """Retorna o id interno do motorista substituto, ou None."""
+    if not substituto:
+        return None
+    cur.execute("SELECT id FROM motoristas WHERE chapa = %s",
+                (str(substituto["employeeId"]),))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -473,10 +479,7 @@ def sync_largadas(cur):
     since = (datetime.now(BRT) - timedelta(days=SYNC_DAYS)).strftime("%Y-%m-%dT00:00:00")
     log(f"🌐 Buscando largadas desde {since}...")
 
-    registros = api_get(
-        "last-departures-by-date",
-        params={"date": since}
-    )
+    registros = api_get("last-departures-by-date", params={"date": since})
     log(f"   {len(registros)} largadas recebidas\n")
 
     inseridos = atualizados = 0
@@ -506,13 +509,13 @@ def sync_largadas(cur):
                 synced_at          = NOW()
             RETURNING (xmax = 0) AS inserido
         """, (
-            r["departureId"], r.get("shiftName"),    r.get("driverName"),
-            r.get("plate"),   r.get("prefixo"),      r.get("vehicleModel"),
+            r["departureId"],      r.get("shiftName"),   r.get("driverName"),
+            r.get("plate"),        r.get("prefixo"),     r.get("vehicleModel"),
             r.get("numberContract"), r.get("supplierCustomer"), r.get("tradeName"),
-            r.get("name"),    r.get("startTime"),    r.get("endTime"),
+            r.get("name"),         r.get("startTime"),   r.get("endTime"),
             r.get("departureDateTime"),
         ))
-        if cur.fetchone()[0]: inseridos  += 1
+        if cur.fetchone()[0]: inseridos   += 1
         else:                 atualizados += 1
 
     log(f"  largadas → {inseridos} inseridas / {atualizados} atualizadas")
@@ -523,24 +526,14 @@ def sync_largadas(cur):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def relatorio(cur):
+    tabelas = ["motoristas", "escala", "largadas", "ferias", "folga"]
     separador()
-    cur.execute("""
-        SELECT table_name,
-               (SELECT COUNT(*) FROM information_schema.columns
-                WHERE table_name = t.table_name AND table_schema = 'public') AS colunas,
-               pg_size_pretty(pg_total_relation_size(quote_ident(table_name)))
-        FROM   information_schema.tables t
-        WHERE  table_schema = 'public'
-          AND  table_name   = ANY(%s)
-        ORDER  BY table_name;
-    """, (["motoristas", "escala", "largadas", "ferias", "folga"],))
-    print(f"  {'Tabela':<18} {'Colunas':>7}  {'Tamanho':>8}")
+    print(f"  {'Tabela':<18} {'Registros':>10}")
     separador()
-    for nome, cols, tam in cur.fetchall():
-        # contar registros
-        cur.execute(f"SELECT COUNT(*) FROM {nome}")
+    for t in tabelas:
+        cur.execute(f"SELECT COUNT(*) FROM {t}")
         qtd = cur.fetchone()[0]
-        print(f"  {nome:<18} {cols:>7}  {tam:>8}  ({qtd} registros)")
+        print(f"  {t:<18} {qtd:>10}")
     separador()
 
 
@@ -558,12 +551,8 @@ def main():
     cur  = conn.cursor()
 
     try:
-        # 1. DDL
-        erros = criar_tabelas(cur)
-        if erros:
-            conn.rollback()
-            log(f"❌ Abortado — erros no DDL: {erros}")
-            sys.exit(1)
+        # 1. DDL (nunca aborta — erros viram avisos com savepoint)
+        criar_tabelas(cur)
         conn.commit()
 
         # 2. Motoristas / Escala / Férias / Folgas
@@ -574,7 +563,6 @@ def main():
         sync_largadas(cur)
         conn.commit()
 
-        # Relatório
         print()
         relatorio(cur)
         print("\n  ✅ Concluído\n")
