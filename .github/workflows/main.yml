@@ -1,15 +1,20 @@
-name: Caravan – Supabase Migration
+name: Caravan – Supabase Sync
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 10,20 * * *"   # 7h e 17h BRT (UTC-3)
   push:
     branches:
       - main
     paths:
       - "caravan_supabase.py"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  migrate:
+  sync:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,11 +28,12 @@ jobs:
       - name: Instalar dependências
         run: pip install -r requirements.txt
 
-      - name: Executar migration
+      - name: Executar sync
         env:
           SUPABASE_HOST:    ${{ secrets.SUPABASE_HOST }}
           SUPABASE_PORTA:   ${{ secrets.SUPABASE_PORTA }}
           SUPABASE_BANCO:   ${{ secrets.SUPABASE_BANCO }}
           SUPABASE_USUARIO: ${{ secrets.SUPABASE_USUARIO }}
           SUPABASE_SENHA:   ${{ secrets.SUPABASE_SENHA }}
+          CARAVAN_API_KEY:  ${{ secrets.CARAVAN_API_KEY }}
         run: python caravan_supabase.py
