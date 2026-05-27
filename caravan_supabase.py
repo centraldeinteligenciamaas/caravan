@@ -107,6 +107,32 @@ STATEMENTS = [
         )
     """},
 
+    # Migração: adiciona colunas novas em escala já existente
+    {"label": "migração: escala.placa", "sql": """
+        ALTER TABLE escala ADD COLUMN IF NOT EXISTS placa VARCHAR(20)
+    """},
+    {"label": "migração: escala.modelo_veiculo", "sql": """
+        ALTER TABLE escala ADD COLUMN IF NOT EXISTS modelo_veiculo VARCHAR(100)
+    """},
+    {"label": "migração: escala.hora_inicio", "sql": """
+        ALTER TABLE escala ADD COLUMN IF NOT EXISTS hora_inicio TIME
+    """},
+    {"label": "migração: escala.hora_fim", "sql": """
+        ALTER TABLE escala ADD COLUMN IF NOT EXISTS hora_fim TIME
+    """},
+    {"label": "migração: escala.constraint_unica", "sql": """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'escala_motorista_contrato_unica'
+                  AND conrelid = 'escala'::regclass
+            ) THEN
+                ALTER TABLE escala ADD CONSTRAINT escala_motorista_contrato_unica
+                    UNIQUE (motorista_id, numero_contrato);
+            END IF;
+        END $$
+    """},
+
     # ── LARGADAS ──────────────────────────────────────────────────────────────
     {"label": "tabela: largadas", "sql": """
         CREATE TABLE IF NOT EXISTS largadas (
