@@ -38,6 +38,7 @@ def get_connection():
         "password":        os.environ.get("SUPABASE_SENHA"),
         "sslmode":         "require",
         "connect_timeout": 10,
+        "options":         "-c timezone=America/Sao_Paulo",
     }
     obrigatorias = {
         "SUPABASE_HOST":    config["host"],
@@ -60,6 +61,10 @@ def get_connection():
 # ──────────────────────────────────────────────────────────────────────────────
 
 STATEMENTS = [
+
+    # ── FUSO HORÁRIO ──────────────────────────────────────────────────────────
+    {"label": "fuso horário: America/Sao_Paulo", "sql":
+        "ALTER DATABASE postgres SET timezone TO 'America/Sao_Paulo'"},
 
     # ── MOTORISTAS ────────────────────────────────────────────────────────────
     {"label": "tabela: motoristas", "sql": """
