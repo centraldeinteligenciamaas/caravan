@@ -6,12 +6,12 @@ Uso local:
     export $(cat .env | xargs)
     python caravan_supabase.py
 
-Via GitHub Actions:
-    Cron: 7h e 17h (BRT) — workflow .github/workflows/main.yml
+Via Render + UptimeRobot:
+    O servidor Flask em app.py agenda a execução às 7h e 17h (BRT).
+    O UptimeRobot monitora GET / a cada 5 min para manter o serviço ativo.
 """
 
 import os
-import sys
 import requests
 import psycopg2
 from datetime import datetime, timezone, timedelta
@@ -49,7 +49,7 @@ def get_connection():
     if faltando:
         for var in faltando:
             print(f"  ❌ Variável não encontrada: {var}")
-        sys.exit(1)
+        raise RuntimeError(f"Variáveis de ambiente obrigatórias não configuradas: {', '.join(faltando)}")
     return psycopg2.connect(**config)
 
 
