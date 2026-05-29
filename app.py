@@ -3,11 +3,12 @@ app.py
 Servidor Flask que expõe endpoints de health check e sync manual,
 e agenda a sincronização automática via APScheduler (7h e 17h BRT).
 
-Deploy: Render Web Service
+Deploy: Render Web Service  (Procfile define o start command)
 Monitoramento: UptimeRobot → GET / a cada 5 min (mantém o serviço acordado)
 """
 
 import os
+import atexit
 import logging
 import threading
 from datetime import datetime, timezone
@@ -41,7 +42,7 @@ def _execute_sync():
         logging.info("Sync concluído com sucesso.")
     except Exception as e:
         _last_run["status"] = f"error: {e}"
-        logging.error(f"Sync falhou: {e}")
+        logging.error("Sync falhou: %s", e)
     finally:
         _sync_lock.release()
 
@@ -65,12 +66,20 @@ def trigger_sync():
     return jsonify({"status": "triggered"})
 
 
-# ── Agendamento: 07:00 e 17:00 BRT (10:00 e 20:00 UTC) ───────────────────────
-# Usar apenas 1 worker no gunicorn para evitar múltiplas instâncias do scheduler.
-scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(_execute_sync, CronTrigger(hour=10, minute=0), id="sync_manha")
-scheduler.add_job(_execute_sync, CronTrigger(hour=20, minute=0), id="sync_tarde")
-scheduler.start()
+def _start_scheduler():
+    """Inicia o APScheduler. Chamado uma única vez após o fork do gunicorn."""
+    scheduler = BackgroundScheduler(timezone="UTC")
+    # 07:00 BRT = 10:00 UTC / 17:00 BRT = 20:00 UTC
+    scheduler.add_job(_execute_sync, CronTrigger(hour=10, minute=0), id="sync_manha")
+    scheduler.add_job(_execute_sync, CronTrigger(hour=20, minute=0), id="sync_tarde")
+    scheduler.start()
+    atexit.register(scheduler.shutdown)
+    logging.info("Scheduler iniciado — próximas execuções: 10:00 UTC e 20:00 UTC")
+
+
+# Inicia o scheduler no processo worker (gunicorn sem --preload importa o módulo
+# somente no worker, então há exatamente 1 instância com --workers 1).
+_start_scheduler()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
