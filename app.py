@@ -69,9 +69,8 @@ def trigger_sync():
 def _start_scheduler():
     """Inicia o APScheduler. Chamado uma única vez após o fork do gunicorn."""
     scheduler = BackgroundScheduler(timezone="UTC")
-    # 07:00 BRT = 10:00 UTC / 17:00 BRT = 20:00 UTC
-    scheduler.add_job(_execute_sync, CronTrigger(hour=10, minute=0), id="sync_manha")
-    scheduler.add_job(_execute_sync, CronTrigger(hour=20, minute=0), id="sync_tarde")
+    scheduler.add_job(_execute_sync, CronTrigger(hour=7, minute=0), id="sync_manha")
+    scheduler.add_job(_execute_sync, CronTrigger(hour=16, minute=0), id="sync_tarde")
     scheduler.start()
     atexit.register(scheduler.shutdown)
     logging.info("Scheduler iniciado — próximas execuções: 10:00 UTC e 20:00 UTC")
