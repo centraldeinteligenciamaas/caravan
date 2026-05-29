@@ -370,8 +370,8 @@ def sync_drivers(cur):
                 INSERT INTO folga (motorista_id, api_id, data_folga,
                                    substituto_id, publish_date)
                 VALUES (%s,%s,%s,%s,%s)
-                ON CONFLICT (api_id) DO UPDATE SET
-                    data_folga=EXCLUDED.data_folga,
+                ON CONFLICT (motorista_id, data_folga) DO UPDATE SET
+                    api_id=EXCLUDED.api_id,
                     substituto_id=EXCLUDED.substituto_id,
                     publish_date=EXCLUDED.publish_date, updated_at=NOW()
                 RETURNING (xmax=0)
