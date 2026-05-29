@@ -11,10 +11,12 @@ import os
 import atexit
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+BRT = timezone(timedelta(hours=-3))
 
 from caravan_supabase import main as run_sync
 
@@ -34,7 +36,7 @@ def _execute_sync():
         logging.info("Sync já em andamento — execução ignorada.")
         return
     try:
-        _last_run["at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _last_run["at"] = datetime.now(BRT).strftime("%Y-%m-%dT%H:%M:%S BRT")
         _last_run["status"] = "running"
         logging.info("Iniciando sync...")
         run_sync()
@@ -68,12 +70,12 @@ def trigger_sync():
 
 def _start_scheduler():
     """Inicia o APScheduler. Chamado uma única vez após o fork do gunicorn."""
-    scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(_execute_sync, CronTrigger(hour=7, minute=0), id="sync_manha")
+    scheduler = BackgroundScheduler(timezone="America/Sao_Paulo")
+    scheduler.add_job(_execute_sync, CronTrigger(hour=7,  minute=0), id="sync_manha")
     scheduler.add_job(_execute_sync, CronTrigger(hour=16, minute=0), id="sync_tarde")
     scheduler.start()
     atexit.register(scheduler.shutdown)
-    logging.info("Scheduler iniciado — próximas execuções: 10:00 UTC e 20:00 UTC")
+    logging.info("Scheduler iniciado — próximas execuções: 07:00 e 16:00 BRT")
 
 
 # Inicia o scheduler no processo worker (gunicorn sem --preload importa o módulo
