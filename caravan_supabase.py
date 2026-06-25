@@ -27,6 +27,10 @@ HEADERS   = {"x-api-key": API_KEY} if API_KEY else {}
 
 BRT       = timezone(timedelta(hours=-3))
 SYNC_DAYS = 30
+# Fração mínima de assigned (motoristas com escala) que o feed precisa trazer, em
+# relação aos que o banco já conhece, para liberar a reclassificação dos ausentes
+# para NENHUM. Protege contra feed curto por soluço da API (ver sync_drivers).
+RECLASS_MIN_RATIO = 0.9
 
 
 def get_connection():
@@ -77,7 +81,7 @@ STATEMENTS = [
                             CHECK (status IN ('ATIVO','INATIVO','AFASTADO')),
             tipo_escala VARCHAR(20)
                             CHECK (tipo_escala IN (
-                                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+                                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA','NENHUM'
                             )),
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -91,13 +95,13 @@ STATEMENTS = [
         ALTER TABLE motoristas
             ADD COLUMN IF NOT EXISTS tipo_escala VARCHAR(20)
     """},
-    # Recria o CHECK incluindo 'FERISTA' (migra bancos cujo constraint só tinha os 5 valores antigos).
+    # Recria o CHECK incluindo 'NENHUM' (migra bancos cujo constraint não tinha o valor).
     {"label": "constraint: motoristas.tipo_escala drop", "sql":
         "ALTER TABLE motoristas DROP CONSTRAINT IF EXISTS motoristas_tipo_escala_check"},
-    {"label": "constraint: motoristas.tipo_escala (+FERISTA)", "sql": """
+    {"label": "constraint: motoristas.tipo_escala (+NENHUM)", "sql": """
         ALTER TABLE motoristas ADD CONSTRAINT motoristas_tipo_escala_check
             CHECK (tipo_escala IN (
-                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA','NENHUM'
             ))
     """},
 
@@ -115,7 +119,7 @@ STATEMENTS = [
                                    )),
             tipo_escala        VARCHAR(20) NOT NULL DEFAULT 'FIXO'
                                    CHECK (tipo_escala IN (
-                                       'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+                                       'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA','NENHUM'
                                    )),
             prefixo            VARCHAR(20),
             placa              VARCHAR(20),
@@ -129,13 +133,13 @@ STATEMENTS = [
                 UNIQUE (motorista_id, numero_contrato)
         )
     """},
-    # Recria o CHECK incluindo 'FERISTA' (migra bancos cujo constraint só tinha os 5 valores antigos).
+    # Recria o CHECK incluindo 'NENHUM' (migra bancos cujo constraint não tinha o valor).
     {"label": "constraint: escala.tipo_escala drop", "sql":
         "ALTER TABLE escala DROP CONSTRAINT IF EXISTS escala_tipo_escala_check"},
-    {"label": "constraint: escala.tipo_escala (+FERISTA)", "sql": """
+    {"label": "constraint: escala.tipo_escala (+NENHUM)", "sql": """
         ALTER TABLE escala ADD CONSTRAINT escala_tipo_escala_check
             CHECK (tipo_escala IN (
-                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA','NENHUM'
             ))
     """},
 
@@ -279,9 +283,12 @@ def norm_turno(s):
     return "PRIMEIRO TURNO"
 
 def norm_tipo(s):
+    # 'Nenhum' = motorista sem escala atribuída. A API só expõe um punhado
+    # flutuante deles (a maioria dos ~300 nunca vem no feed), então NÃO entram
+    # no FIXO — vão para o balde próprio NENHUM, que é ignorado nas consultas.
     return {"fixo":"FIXO","folguista":"FOLGUISTA","reserva":"RESERVA",
             "afastado":"AFASTADO","apoio":"APOIO","ferista":"FERISTA",
-            "nenhum":"FIXO"}.get((s or "").lower(), "FIXO")
+            "nenhum":"NENHUM"}.get((s or "").lower(), "FIXO")
 
 def norm_status(s):
     s = (s or "").lower()
@@ -333,11 +340,14 @@ def sync_drivers(cur):
 
     mi = mu = ei = eu = fi = fu = oi = ou = 0
     chapas_vistas = []
+    assigned_vistos = 0   # motoristas com escala (tipo != NENHUM) vindos no feed
 
     for item in dados:
         drv   = item["driver"]
         chapa = str(drv["employeeId"])
+        tipo  = norm_tipo(drv.get("type","Fixo"))
         chapas_vistas.append(chapa)
+        if tipo != "NENHUM": assigned_vistos += 1
 
         # Motorista
         cur.execute("""
@@ -349,17 +359,21 @@ def sync_drivers(cur):
                 updated_at=NOW()
             RETURNING (xmax=0)
         """, (chapa, drv["name"], drv.get("position"),
-              norm_status(drv.get("status","Ativo")),
-              norm_tipo(drv.get("type","Fixo"))))
+              norm_status(drv.get("status","Ativo")), tipo))
         if cur.fetchone()[0]: mi += 1
         else: mu += 1
 
         cur.execute("SELECT id FROM motoristas WHERE chapa=%s", (chapa,))
         mot_id = cur.fetchone()[0]
 
-        # Escala
-        sched = item.get("regularSchedule") or {}
-        if sched:
+        # Escala — só registra se houver contrato. A API às vezes devolve um
+        # motorista 'Nenhum' com regularSchedule "fantasma" e contractNumber null;
+        # como numero_contrato é NOT NULL + parte da UNIQUE(motorista_id, contrato),
+        # escala sem contrato nunca foi registro válido — pulamos (sem perder dado:
+        # escala legítima sempre traz contrato).
+        sched    = item.get("regularSchedule") or {}
+        contrato = (drv.get("contractNumber") or "").strip()
+        if sched and contrato:
             v      = sched.get("vehicle") or {}
             shift  = sched.get("shift") or drv.get("shift") or {}
             loc    = sched.get("startLocation") or {}
@@ -378,9 +392,8 @@ def sync_drivers(cur):
                     hora_inicio=EXCLUDED.hora_inicio, hora_fim=EXCLUDED.hora_fim,
                     updated_at=NOW()
                 RETURNING (xmax=0)
-            """, (mot_id, drv.get("contractNumber",""), drv.get("clientName"),
-                  norm_turno(shift.get("shiftName","")),
-                  norm_tipo(drv.get("type","Fixo")),
+            """, (mot_id, contrato, drv.get("clientName"),
+                  norm_turno(shift.get("shiftName","")), tipo,
                   v.get("prefixo"), v.get("plate"), modelo, loc.get("name"),
                   shift.get("startTime"), shift.get("endTime")))
             if cur.fetchone()[0]: ei += 1
@@ -420,15 +433,36 @@ def sync_drivers(cur):
             if cur.fetchone()[0]: oi += 1
             else: ou += 1
 
-    # Motoristas que não vieram mais no feed da API → marca INATIVO (não deleta,
-    # preserva escala/férias/folgas históricas). Só conta os que mudaram de fato.
-    cur.execute("""
-        UPDATE motoristas SET status='INATIVO', updated_at=NOW()
-        WHERE chapa <> ALL(%s) AND status <> 'INATIVO'
-    """, (chapas_vistas,))
-    desativados = cur.rowcount
+    # Quem NÃO veio no feed = motorista sem escala atribuída ('Nenhum'). A API só
+    # expõe os assigned (Fixo/Folguista/Reserva/Afastado/Apoio/Ferista — estáveis
+    # entre chamadas) + um punhado flutuante de 'Nenhum'; os ~300 'Nenhum' restantes
+    # nunca vêm. Por isso "ausente do feed" ⇔ "Nenhum", e marcamos tipo_escala=NENHUM
+    # (não INATIVO: ausência não é demissão, a API não tem sinal de desligamento).
+    # Isso também limpa os 'Nenhum' que ficaram presos como FIXO de feeds antigos,
+    # fazendo os tipos assigned baterem com o sistema. status volta a ATIVO para
+    # desfazer marcações INATIVO antigas. Nada deleta — escala/férias/folgas ficam.
+    #
+    # SALVAGUARDA: a API às vezes engasga e devolve um feed curto. Se varrêssemos
+    # cegamente, um soluço transformaria assigned reais em NENHUM (perderíamos gente
+    # da contagem). Só reclassificamos se o nº de assigned do feed estiver dentro de
+    # RECLASS_MIN_RATIO do que o banco já conhece; senão pulamos e avisamos.
+    cur.execute("SELECT COUNT(*) FROM motoristas WHERE tipo_escala IS DISTINCT FROM 'NENHUM'")
+    assigned_no_banco = cur.fetchone()[0]
+    piso = assigned_no_banco * RECLASS_MIN_RATIO
 
-    log(f"  motoristas → {mi} inseridos / {mu} atualizados / {desativados} desativados (fora do feed)")
+    if assigned_vistos >= piso:
+        cur.execute("""
+            UPDATE motoristas SET tipo_escala='NENHUM', status='ATIVO', updated_at=NOW()
+            WHERE chapa <> ALL(%s)
+              AND (tipo_escala IS DISTINCT FROM 'NENHUM' OR status <> 'ATIVO')
+        """, (chapas_vistas,))
+        nenhum = cur.rowcount
+        log(f"  motoristas → {mi} inseridos / {mu} atualizados / {nenhum} fora do feed → NENHUM")
+    else:
+        log(f"  motoristas → {mi} inseridos / {mu} atualizados")
+        log(f"  ⚠️  feed curto: {assigned_vistos} assigned vindos < piso {piso:.0f} "
+            f"({assigned_no_banco} no banco × {RECLASS_MIN_RATIO}). "
+            f"Reclassificação p/ NENHUM PULADA — possível soluço da API.")
     log(f"  escala     → {ei} inseridos / {eu} atualizados")
     log(f"  férias     → {fi} inseridos / {fu} atualizados")
     log(f"  folgas     → {oi} inseridos / {ou} atualizados")
