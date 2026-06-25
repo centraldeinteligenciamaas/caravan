@@ -69,15 +69,36 @@ STATEMENTS = [
     # ── MOTORISTAS ────────────────────────────────────────────────────────────
     {"label": "tabela: motoristas", "sql": """
         CREATE TABLE IF NOT EXISTS motoristas (
-            id         SERIAL      PRIMARY KEY,
-            chapa      VARCHAR(20) NOT NULL UNIQUE,
-            nome       VARCHAR(200) NOT NULL,
-            funcao     VARCHAR(100),
-            status     VARCHAR(20) NOT NULL DEFAULT 'ATIVO'
-                           CHECK (status IN ('ATIVO','INATIVO','AFASTADO')),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id          SERIAL      PRIMARY KEY,
+            chapa       VARCHAR(20) NOT NULL UNIQUE,
+            nome        VARCHAR(200) NOT NULL,
+            funcao      VARCHAR(100),
+            status      VARCHAR(20) NOT NULL DEFAULT 'ATIVO'
+                            CHECK (status IN ('ATIVO','INATIVO','AFASTADO')),
+            tipo_escala VARCHAR(20)
+                            CHECK (tipo_escala IN (
+                                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+                            )),
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+    """},
+
+    # Garante a coluna em bancos já existentes (CREATE TABLE IF NOT EXISTS não altera tabela pronta).
+    # O campo 'type' da API (Fixo/Afastado/Folguista/Ferista/...) carrega a situação real do motorista;
+    # 'status' da API vem sempre como "Ativo", por isso não diferencia nada.
+    {"label": "coluna: motoristas.tipo_escala", "sql": """
+        ALTER TABLE motoristas
+            ADD COLUMN IF NOT EXISTS tipo_escala VARCHAR(20)
+    """},
+    # Recria o CHECK incluindo 'FERISTA' (migra bancos cujo constraint só tinha os 5 valores antigos).
+    {"label": "constraint: motoristas.tipo_escala drop", "sql":
+        "ALTER TABLE motoristas DROP CONSTRAINT IF EXISTS motoristas_tipo_escala_check"},
+    {"label": "constraint: motoristas.tipo_escala (+FERISTA)", "sql": """
+        ALTER TABLE motoristas ADD CONSTRAINT motoristas_tipo_escala_check
+            CHECK (tipo_escala IN (
+                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+            ))
     """},
 
     # ── ESCALA ────────────────────────────────────────────────────────────────
@@ -94,7 +115,7 @@ STATEMENTS = [
                                    )),
             tipo_escala        VARCHAR(20) NOT NULL DEFAULT 'FIXO'
                                    CHECK (tipo_escala IN (
-                                       'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO'
+                                       'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
                                    )),
             prefixo            VARCHAR(20),
             placa              VARCHAR(20),
@@ -107,6 +128,15 @@ STATEMENTS = [
             CONSTRAINT escala_motorista_contrato_unica
                 UNIQUE (motorista_id, numero_contrato)
         )
+    """},
+    # Recria o CHECK incluindo 'FERISTA' (migra bancos cujo constraint só tinha os 5 valores antigos).
+    {"label": "constraint: escala.tipo_escala drop", "sql":
+        "ALTER TABLE escala DROP CONSTRAINT IF EXISTS escala_tipo_escala_check"},
+    {"label": "constraint: escala.tipo_escala (+FERISTA)", "sql": """
+        ALTER TABLE escala ADD CONSTRAINT escala_tipo_escala_check
+            CHECK (tipo_escala IN (
+                'FIXO','FOLGUISTA','RESERVA','AFASTADO','APOIO','FERISTA'
+            ))
     """},
 
     # ── LARGADAS ──────────────────────────────────────────────────────────────
@@ -250,7 +280,7 @@ def norm_turno(s):
 
 def norm_tipo(s):
     return {"fixo":"FIXO","folguista":"FOLGUISTA","reserva":"RESERVA",
-            "afastado":"AFASTADO","apoio":"APOIO","ferista":"AFASTADO",
+            "afastado":"AFASTADO","apoio":"APOIO","ferista":"FERISTA",
             "nenhum":"FIXO"}.get((s or "").lower(), "FIXO")
 
 def norm_status(s):
@@ -302,21 +332,25 @@ def sync_drivers(cur):
     log(f"   {len(dados)} motoristas recebidos\n")
 
     mi = mu = ei = eu = fi = fu = oi = ou = 0
+    chapas_vistas = []
 
     for item in dados:
         drv   = item["driver"]
         chapa = str(drv["employeeId"])
+        chapas_vistas.append(chapa)
 
         # Motorista
         cur.execute("""
-            INSERT INTO motoristas (chapa, nome, funcao, status)
-            VALUES (%s,%s,%s,%s)
+            INSERT INTO motoristas (chapa, nome, funcao, status, tipo_escala)
+            VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT (chapa) DO UPDATE SET
                 nome=EXCLUDED.nome, funcao=EXCLUDED.funcao,
-                status=EXCLUDED.status, updated_at=NOW()
+                status=EXCLUDED.status, tipo_escala=EXCLUDED.tipo_escala,
+                updated_at=NOW()
             RETURNING (xmax=0)
         """, (chapa, drv["name"], drv.get("position"),
-              norm_status(drv.get("status","Ativo"))))
+              norm_status(drv.get("status","Ativo")),
+              norm_tipo(drv.get("type","Fixo"))))
         if cur.fetchone()[0]: mi += 1
         else: mu += 1
 
@@ -386,7 +420,15 @@ def sync_drivers(cur):
             if cur.fetchone()[0]: oi += 1
             else: ou += 1
 
-    log(f"  motoristas → {mi} inseridos / {mu} atualizados")
+    # Motoristas que não vieram mais no feed da API → marca INATIVO (não deleta,
+    # preserva escala/férias/folgas históricas). Só conta os que mudaram de fato.
+    cur.execute("""
+        UPDATE motoristas SET status='INATIVO', updated_at=NOW()
+        WHERE chapa <> ALL(%s) AND status <> 'INATIVO'
+    """, (chapas_vistas,))
+    desativados = cur.rowcount
+
+    log(f"  motoristas → {mi} inseridos / {mu} atualizados / {desativados} desativados (fora do feed)")
     log(f"  escala     → {ei} inseridos / {eu} atualizados")
     log(f"  férias     → {fi} inseridos / {fu} atualizados")
     log(f"  folgas     → {oi} inseridos / {ou} atualizados")
